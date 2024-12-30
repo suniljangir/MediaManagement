@@ -31,22 +31,35 @@ const db = new sqlite3.Database('./database.sqlite', (err) => {
     }
 });
 
+// Add admin credentials check
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
+
 // Initialize database tables
 function initializeDatabase() {
     db.serialize(() => {
-        // Users table
+        // Users table with additional fields
         db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            role TEXT NOT NULL
-        )`);
+            role TEXT NOT NULL CHECK (role IN ('admin', 'school')),
+            school_name TEXT,
+            address TEXT,
+            contact_person TEXT,
+            phone TEXT,
+            email TEXT,
+            banned INTEGER DEFAULT 0 CHECK (banned IN (0, 1))
+        )`, (err) => {
+            if (err) {
+                console.error('Error creating users table:', err);
+            } else {
+                console.log('Users table initialized successfully');
+            }
+        });
 
-        // Drop existing media table if it exists
-        db.run(`DROP TABLE IF EXISTS media`);
-
-        // Create new media table with updated schema
-        db.run(`CREATE TABLE media (
+        // Media table with updated schema
+        db.run(`CREATE TABLE IF NOT EXISTS media (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             filename TEXT NOT NULL,
             type TEXT NOT NULL,
@@ -56,9 +69,45 @@ function initializeDatabase() {
             tags TEXT,
             user_id INTEGER,
             FOREIGN KEY (user_id) REFERENCES users (id)
-        )`);
+        )`, (err) => {
+            if (err) {
+                console.error('Error creating media table:', err);
+            } else {
+                console.log('Media table initialized successfully');
+            }
+        });
 
-        console.log('Database tables initialized successfully');
+        // Add missing columns to users table if they don't exist
+        db.all("PRAGMA table_info(users)", [], (err, columns) => {
+            if (err) {
+                console.error('Error checking table columns:', err);
+                return;
+            }
+
+            const columnNames = columns.map(col => col.name);
+            const missingColumns = [
+                { name: 'school_name', type: 'TEXT' },
+                { name: 'address', type: 'TEXT' },
+                { name: 'contact_person', type: 'TEXT' },
+                { name: 'phone', type: 'TEXT' },
+                { name: 'email', type: 'TEXT' },
+                { name: 'banned', type: 'INTEGER DEFAULT 0' }
+            ];
+
+            missingColumns.forEach(column => {
+                if (!columnNames.includes(column.name)) {
+                    db.run(`ALTER TABLE users ADD COLUMN ${column.name} ${column.type}`, (err) => {
+                        if (err) {
+                            console.error(`Error adding column ${column.name}:`, err);
+                        } else {
+                            console.log(`Added column ${column.name} to users table`);
+                        }
+                    });
+                }
+            });
+        });
+
+        console.log('Database initialization completed');
     });
 }
 
@@ -157,12 +206,38 @@ app.post('/api/login', async (req, res) => {
     }
 
     try {
+        // Check for admin login
+        if (username === ADMIN_USERNAME) {
+            if (password === ADMIN_PASSWORD) {
+                const token = jwt.sign(
+                    { id: 0, username: ADMIN_USERNAME, role: 'admin' },
+                    process.env.JWT_SECRET || 'your-secret-key',
+                    { expiresIn: '24h' }
+                );
+                return res.json({
+                    token,
+                    user: {
+                        id: 0,
+                        username: ADMIN_USERNAME,
+                        role: 'admin'
+                    }
+                });
+            }
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        // Regular user login
         db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
             if (err) {
                 return res.status(500).json({ error: 'Database error' });
             }
             if (!user) {
                 return res.status(401).json({ error: 'Invalid credentials' });
+            }
+
+            // Check if user is banned
+            if (user.banned) {
+                return res.status(403).json({ error: 'Your account has been banned by the administrator' });
             }
 
             // Compare password
@@ -195,7 +270,26 @@ app.post('/api/login', async (req, res) => {
 });
 
 // Media routes
-app.post('/api/upload', authenticateToken, upload.array('files', 10), async (req, res) => {
+app.post('/api/upload', authenticateToken, async (req, res, next) => {
+    // Check if user is banned
+    try {
+        const user = await new Promise((resolve, reject) => {
+            db.get('SELECT banned FROM users WHERE id = ?', [req.user.id], (err, row) => {
+                if (err) reject(err);
+                else resolve(row);
+            });
+        });
+
+        if (user && user.banned) {
+            return res.status(403).json({ error: 'Your account has been banned by the administrator' });
+        }
+
+        next();
+    } catch (error) {
+        console.error('Error checking ban status:', error);
+        return res.status(500).json({ error: 'Server error' });
+    }
+}, upload.array('files', 10), async (req, res) => {
     if (!req.files || req.files.length === 0) {
         return res.status(400).json({ error: 'No files uploaded' });
     }
@@ -422,6 +516,236 @@ app.get('/api/events/suggestions', authenticateToken, (req, res) => {
         }
         res.json(rows.map(row => row.event_name));
     });
+});
+
+// Profile routes
+app.get('/api/profile', authenticateToken, (req, res) => {
+  const userId = req.user.id;
+  
+  db.get(
+    `SELECT username FROM users WHERE id = ?`,
+    [userId],
+    (err, user) => {
+      if (err) {
+        console.error('Error fetching profile:', err);
+        return res.status(500).json({ error: 'Failed to fetch profile' });
+      }
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      res.json({
+        username: user.username,
+        schoolName: '',
+        address: '',
+        contactPerson: '',
+        phone: '',
+        email: ''
+      });
+    }
+  );
+});
+
+app.put('/api/profile', authenticateToken, (req, res) => {
+  const userId = req.user.id;
+  const { schoolName, address, contactPerson, phone, email } = req.body;
+
+  db.run(
+    `UPDATE users SET 
+    school_name = ?, 
+    address = ?, 
+    contact_person = ?, 
+    phone = ?, 
+    email = ? 
+    WHERE id = ?`,
+    [schoolName, address, contactPerson, phone, email, userId],
+    function(err) {
+      if (err) {
+        console.error('Error updating profile:', err);
+        return res.status(500).json({ error: 'Failed to update profile' });
+      }
+      res.json({ message: 'Profile updated successfully' });
+    }
+  );
+});
+
+app.put('/api/profile/password', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { currentPassword, newPassword } = req.body;
+
+  try {
+    // Get user's current password
+    const user = await new Promise((resolve, reject) => {
+      db.get('SELECT password FROM users WHERE id = ?', [userId], (err, row) => {
+        if (err) reject(err);
+        else resolve(row);
+      });
+    });
+
+    // Verify current password
+    const bcrypt = require('bcryptjs');
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ error: 'Current password is incorrect' });
+    }
+
+    // Hash new password
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(newPassword, salt);
+
+    // Update password
+    await new Promise((resolve, reject) => {
+      db.run(
+        'UPDATE users SET password = ? WHERE id = ?',
+        [hashedPassword, userId],
+        function(err) {
+          if (err) reject(err);
+          else resolve();
+        }
+      );
+    });
+
+    res.json({ message: 'Password updated successfully' });
+  } catch (error) {
+    console.error('Error updating password:', error);
+    res.status(500).json({ error: 'Failed to update password' });
+  }
+});
+
+// Add admin routes
+app.get('/api/admin/schools', authenticateToken, (req, res) => {
+    // Check if user is admin
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    // Add error logging
+    db.all(
+        `SELECT id, username, role, school_name, address, contact_person, phone, email, banned
+        FROM users 
+        WHERE role = 'school'
+        ORDER BY username ASC`,
+        [],
+        (err, schools) => {
+            if (err) {
+                console.error('Database error in /api/admin/schools:', err);
+                return res.status(500).json({ error: 'Database error' });
+            }
+            
+            // If no schools found, return empty array instead of error
+            if (!schools) {
+                return res.json([]);
+            }
+            
+            res.json(schools);
+        }
+    );
+});
+
+app.put('/api/admin/schools/:id/ban', authenticateToken, (req, res) => {
+    // Check if user is admin
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const { id } = req.params;
+    const { banned } = req.body;
+
+    db.run(
+        'UPDATE users SET banned = ? WHERE id = ? AND role = "school"',
+        [banned ? 1 : 0, id],
+        function(err) {
+            if (err) {
+                return res.status(500).json({ error: 'Database error' });
+            }
+            if (this.changes === 0) {
+                return res.status(404).json({ error: 'School not found' });
+            }
+            res.json({ message: `School ${banned ? 'banned' : 'unbanned'} successfully` });
+        }
+    );
+});
+
+app.get('/api/admin/stats', authenticateToken, async (req, res) => {
+    // Check if user is admin
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    try {
+        // Get total users count
+        const usersPromise = new Promise((resolve, reject) => {
+            db.get(
+                'SELECT COUNT(*) as total FROM users WHERE role = "school"',
+                (err, result) => {
+                    if (err) reject(err);
+                    else resolve(result.total);
+                }
+            );
+        });
+
+        // Get total files and events count
+        const statsPromise = new Promise((resolve, reject) => {
+            db.get(
+                `SELECT 
+                    COUNT(*) as totalFiles,
+                    COUNT(DISTINCT event_name) as totalEvents,
+                    COUNT(DISTINCT user_id) as activeSchools
+                FROM media`,
+                (err, result) => {
+                    if (err) reject(err);
+                    else resolve(result);
+                }
+            );
+        });
+
+        // Calculate total size of all files
+        const calculateTotalSize = async () => {
+            const files = await new Promise((resolve, reject) => {
+                db.all('SELECT filename FROM media', (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows);
+                });
+            });
+
+            let totalSize = 0;
+            for (const file of files) {
+                try {
+                    const stats = fs.statSync(path.join(uploadsDir, file.filename));
+                    totalSize += stats.size;
+                } catch (error) {
+                    console.error(`Error reading file size for ${file.filename}:`, error);
+                }
+            }
+            return totalSize;
+        };
+
+        const [totalUsers, stats, totalSize] = await Promise.all([
+            usersPromise,
+            statsPromise,
+            calculateTotalSize()
+        ]);
+
+        // Format size
+        const formatSize = (bytes) => {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        };
+
+        res.json({
+            totalUsers,
+            totalFiles: stats.totalFiles,
+            totalEvents: stats.totalEvents,
+            activeSchools: stats.activeSchools,
+            totalSize: formatSize(totalSize),
+            totalSizeBytes: totalSize
+        });
+    } catch (error) {
+        console.error('Error getting admin stats:', error);
+        res.status(500).json({ error: 'Failed to get stats' });
+    }
 });
 
 // Start server

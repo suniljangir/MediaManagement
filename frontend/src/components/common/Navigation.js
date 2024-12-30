@@ -19,16 +19,18 @@ import { useAuth } from '../../contexts/AuthContext';
 const Navigation = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const { isAuthenticated, logout } = useAuth();
+  const { isAuthenticated, logout, user } = useAuth();
   const [anchorElNav, setAnchorElNav] = useState(null);
   const [anchorElUser, setAnchorElUser] = useState(null);
 
   const pages = isAuthenticated
-    ? [
-        { name: 'Dashboard', path: '/' },
-        { name: 'Events', path: '/events' },
-        { name: 'Upload Media', path: '/upload' },
-      ]
+    ? user?.role === 'admin'
+      ? [] // Admin doesn't need navigation items as everything is on dashboard
+      : [
+          { name: 'Dashboard', path: '/' },
+          { name: 'Events', path: '/events' },
+          { name: 'Upload Media', path: '/upload' },
+        ]
     : [];
 
   const settings = ['Profile', 'Logout'];
@@ -58,6 +60,8 @@ const Navigation = () => {
     if (setting === 'Logout') {
       logout();
       navigate('/login');
+    } else if (setting === 'Profile') {
+      navigate('/profile');
     }
     handleCloseUserMenu();
   };
@@ -74,12 +78,13 @@ const Navigation = () => {
             component="div"
             sx={{ mr: 2, display: { xs: 'none', md: 'flex' } }}
           >
-            Media Management
+            {user?.role === 'admin' ? 'Admin Dashboard' : 'Media Management'}
           </Typography>
 
           <Box sx={{ flexGrow: 1, display: { xs: 'flex', md: 'none' } }}>
             <IconButton
               size="large"
+              aria-label="account of current user"
               aria-controls="menu-appbar"
               aria-haspopup="true"
               onClick={handleOpenNavMenu}
@@ -106,10 +111,7 @@ const Navigation = () => {
               }}
             >
               {pages.map((page) => (
-                <MenuItem
-                  key={page.name}
-                  onClick={() => handleMenuClick(page.path)}
-                >
+                <MenuItem key={page.name} onClick={() => handleMenuClick(page.path)}>
                   <Typography textAlign="center">{page.name}</Typography>
                 </MenuItem>
               ))}
