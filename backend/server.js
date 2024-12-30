@@ -5,6 +5,7 @@ const multer = require('multer');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
+const archiver = require('archiver');
 require('dotenv').config();
 
 const app = express();
@@ -745,6 +746,78 @@ app.get('/api/admin/stats', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('Error getting admin stats:', error);
         res.status(500).json({ error: 'Failed to get stats' });
+    }
+});
+
+// Admin media routes
+app.get('/api/admin/media', authenticateToken, (req, res) => {
+    // Check if user is admin
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    db.all(
+        `SELECT m.*, u.username as school_name
+        FROM media m
+        LEFT JOIN users u ON m.user_id = u.id
+        ORDER BY m.upload_date DESC`,
+        (err, media) => {
+            if (err) {
+                console.error('Database error in /api/admin/media:', err);
+                return res.status(500).json({ error: 'Database error' });
+            }
+            res.json(media);
+        }
+    );
+});
+
+app.post('/api/admin/media/download', authenticateToken, async (req, res) => {
+    // Check if user is admin
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    const { files } = req.body;
+    if (!files || !Array.isArray(files) || files.length === 0) {
+        return res.status(400).json({ error: 'No files specified' });
+    }
+
+    try {
+        // Get file information from database
+        const fileInfos = await new Promise((resolve, reject) => {
+            const placeholders = files.map(() => '?').join(',');
+            db.all(
+                `SELECT filename FROM media WHERE id IN (${placeholders})`,
+                files,
+                (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows);
+                }
+            );
+        });
+
+        // Create zip file
+        const archive = archiver('zip', {
+            zlib: { level: 9 }
+        });
+
+        // Set response headers
+        res.attachment('media-files.zip');
+        archive.pipe(res);
+
+        // Add files to archive
+        fileInfos.forEach(file => {
+            const filePath = path.join(uploadsDir, file.filename);
+            if (fs.existsSync(filePath)) {
+                archive.file(filePath, { name: file.filename });
+            }
+        });
+
+        // Finalize archive
+        await archive.finalize();
+    } catch (error) {
+        console.error('Error creating zip file:', error);
+        res.status(500).json({ error: 'Failed to create zip file' });
     }
 });
 
